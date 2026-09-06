@@ -42,12 +42,7 @@ func setupTestRouter(t *testing.T) (*gin.Engine, *sql.DB) {
 	require.NoError(t, db.PingContext(ctx), "Postgres must be reachable for integration testing")
 
 	// Clean tables before each run
-	_, err = db.Exec(`
-		TRUNCATE TABLE ledger_entries CASCADE;
-		TRUNCATE TABLE transfers CASCADE;
-		TRUNCATE TABLE idempotency_records CASCADE;
-		TRUNCATE TABLE wallets CASCADE;
-	`)
+	_, err = db.ExecContext(ctx, "TRUNCATE TABLE ledger_entries, transfers, idempotency_records, wallets CASCADE")
 	require.NoError(t, err)
 
 	cfg := &config.Config{

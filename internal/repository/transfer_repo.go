@@ -58,6 +58,23 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 	}
 	defer tx.Rollback()
 
+	// Lock the idempotency record for the lifetime of this transaction so no
+	// concurrent worker can steal/reclaim this lease if execution runs long.
+	lockIdempQuery := `
+		SELECT status 
+		FROM idempotency_records 
+		WHERE key = $1 
+		FOR UPDATE
+	`
+	var idempStatus model.IdempotencyStatus
+	if err := tx.QueryRowContext(ctx, lockIdempQuery, transfer.IdempotencyKey).Scan(&idempStatus); err != nil {
+		slog.ErrorContext(ctx, "transfer repository failed to lock idempotency record", "key", transfer.IdempotencyKey, "error", err)
+		return fmt.Errorf("failed to lock idempotency record: %w", err)
+	}
+	if idempStatus != model.IdempotencyStatusStarted {
+		return fmt.Errorf("idempotency record %s has invalid status %s for transfer execution", transfer.IdempotencyKey, idempStatus)
+	}
+
 	// Deterministic Lock Ordering:
 	// Always sort wallet IDs lexicographically to prevent deadlocks across concurrent transfers.
 	firstID, secondID := transfer.FromWalletID, transfer.ToWalletID

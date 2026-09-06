@@ -87,15 +87,14 @@ func (r *idempotencyRepository) TryAcquire(
 		return nil, false, apperror.ErrPayloadMismatch
 	}
 
-	// Expiration check (Already marked EXPIRED, or exceeds 24-hour retention)
+	// Expiration check (Already marked EXPIRED, or exceeds retention window)
 	if rec.Status == model.IdempotencyStatusExpired || time.Since(rec.CreatedAt) > retention {
 		if rec.Status != model.IdempotencyStatusExpired {
-			// Persist the status transition to EXPIRED in PostgreSQL
 			expireQuery := `
-                UPDATE idempotency_records
-                SET status = $1, updated_at = CURRENT_TIMESTAMP
-                WHERE key = $2
-            `
+				UPDATE idempotency_records
+				SET status = $1, updated_at = CURRENT_TIMESTAMP
+				WHERE key = $2
+			`
 			if _, err := r.db.ExecContext(ctx, expireQuery, model.IdempotencyStatusExpired, key); err != nil {
 				slog.WarnContext(ctx, "failed to transition expired idempotency record", "idempotency_key", key, "error", err)
 			}
@@ -106,17 +105,37 @@ func (r *idempotencyRepository) TryAcquire(
 	// Active lease / crash recovery check
 	if rec.Status == model.IdempotencyStatusStarted {
 		if time.Since(rec.UpdatedAt) > lockTTL {
-			// Crash recovery: reclaim lease using optimistic check on updated_at
-			takeoverQuery := `
-				UPDATE idempotency_records
-				SET updated_at = CURRENT_TIMESTAMP
-				WHERE key = $1 AND status = $2 AND updated_at = $3
-			`
-			takeoverRes, err := r.db.ExecContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt)
+			// Attempt safe lease takeover:
+			// Use a separate short transaction with FOR UPDATE NOWAIT.
+			// If an active transfer holds the row lock, NOWAIT immediately fails without blocking,
+			// proving the original operation is still executing.
+			tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 			if err == nil {
-				if count, _ := takeoverRes.RowsAffected(); count == 1 {
-					return nil, true, nil // Successfully reclaimed expired lease
+				lockQuery := `
+					SELECT status 
+					FROM idempotency_records 
+					WHERE key = $1 
+					FOR UPDATE NOWAIT
+				`
+				var currentStatus model.IdempotencyStatus
+				err = tx.QueryRowContext(ctx, lockQuery, key).Scan(&currentStatus)
+				if err == nil && currentStatus == model.IdempotencyStatusStarted {
+					takeoverQuery := `
+						UPDATE idempotency_records
+						SET updated_at = CURRENT_TIMESTAMP
+						WHERE key = $1 AND status = $2 AND updated_at = $3
+					`
+					updateRes, updateErr := tx.ExecContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt)
+					if updateErr == nil {
+						if count, _ := updateRes.RowsAffected(); count == 1 {
+							if commitErr := tx.Commit(); commitErr == nil {
+								slog.InfoContext(ctx, "idempotency repository reclaimed expired lease", "idempotency_key", key)
+								return nil, true, nil
+							}
+						}
+					}
 				}
+				_ = tx.Rollback()
 			}
 		}
 		return nil, false, apperror.ErrRequestInProgress
