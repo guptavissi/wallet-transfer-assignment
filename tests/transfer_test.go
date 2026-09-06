@@ -134,6 +134,7 @@ func TestTransfer_SuccessfulExecutionAndDoubleEntryLedger(t *testing.T) {
 			assert.Equal(t, int64(7000), after)
 		}
 	}
+	require.NoError(t, rows.Err())
 }
 
 func TestTransfer_IdempotencyReplay(t *testing.T) {
