@@ -103,6 +103,7 @@ ENVIRONMENT=development
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/walletDB?sslmode=disable
 IDEMPOTENCY_LOCK_TTL_SECONDS=30
 IDEMPOTENCY_RETENTION_SECONDS=86400
+ALLOWED_ORIGIN=http://localhost:3000
 
 ## How to Run
 1. Ensure PostgreSQL is running and initialize the database schema:

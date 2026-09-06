@@ -101,7 +101,11 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 
 		var cachedResp model.CreateTransferResponse
 		if err := json.Unmarshal([]byte(record.ResponseBody), &cachedResp); err != nil {
-			return nil, record.ResponseCode, errors.New(record.ResponseBody)
+			logger.ErrorContext(ctx, "failed to unmarshal cached response body",
+				"error", err,
+				"response_body", record.ResponseBody,
+			)
+			return nil, http.StatusInternalServerError, fmt.Errorf("corrupted idempotency payload: %w", err)
 		}
 		return &cachedResp, record.ResponseCode, nil
 	}
@@ -173,6 +177,19 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 		}
 
 		logger.ErrorContext(ctx, "system failure during transfer execution", "error", err)
+
+		// Persist a generic 500 FAILED idempotency outcome so subsequent retries
+		// get a deterministic failure without hanging behind an in-progress lock.
+		if saveErr := s.idempotencyRepo.SaveResult(
+			ctx,
+			req.IdempotencyKey,
+			model.IdempotencyStatusFailed,
+			http.StatusInternalServerError,
+			"internal system error during transfer execution",
+		); saveErr != nil {
+			logger.WarnContext(ctx, "failed persisting 500 idempotency outcome", "error", saveErr)
+		}
+
 		return nil, http.StatusInternalServerError, fmt.Errorf("transfer execution failed: %w", err)
 	}
 

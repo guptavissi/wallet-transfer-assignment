@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+DROP TRIGGER IF EXISTS trg_wallets_updated_at ON wallets;
 CREATE TRIGGER trg_wallets_updated_at
 BEFORE UPDATE ON wallets
 FOR EACH ROW
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS transfers (
     CONSTRAINT chk_distinct_wallets CHECK (from_wallet_id <> to_wallet_id)
 );
 
+DROP TRIGGER IF EXISTS trg_transfers_updated_at ON transfers;
 CREATE TRIGGER trg_transfers_updated_at
 BEFORE UPDATE ON transfers
 FOR EACH ROW
@@ -111,6 +113,7 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+DROP TRIGGER IF EXISTS trg_idempotency_records_updated_at ON idempotency_records;
 CREATE TRIGGER trg_idempotency_records_updated_at
 BEFORE UPDATE ON idempotency_records
 FOR EACH ROW

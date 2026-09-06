@@ -60,7 +60,7 @@ func setupTestRouter(t *testing.T) (*gin.Engine, *sql.DB) {
 	walletHandler := handler.NewWalletHandler(walletService)
 	transferHandler := handler.NewTransferHandler(transferService)
 
-	router := routes.SetupRouter(walletHandler, transferHandler)
+	router := routes.SetupRouter(walletHandler, transferHandler, []string{"http://localhost:3000"})
 
 	return router, db
 }

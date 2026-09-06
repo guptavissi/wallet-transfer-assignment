@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -12,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"wallet-transfer-service/internal/config"
+	"wallet-transfer-service/internal/database"
 	"wallet-transfer-service/internal/handler"
 	"wallet-transfer-service/internal/repository"
 	"wallet-transfer-service/internal/routes"
@@ -35,25 +34,13 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// PostgreSQL connection pool via pgx driver
-	db, err := sql.Open("pgx", cfg.DatabaseURL)
+	// PostgreSQL connection pool via centralized database package
+	db, err := database.ConnectDB(cfg.DatabaseURL)
 	if err != nil {
-		slog.Error("failed opening db connection", "error", err)
+		slog.Error("database initialization failed", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
-
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		slog.Error("failed pinging db", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("connected to postgresql successfully")
 
 	// Repositories
 	walletRepo := repository.NewWalletRepository(db)
@@ -68,7 +55,7 @@ func main() {
 	walletHandler := handler.NewWalletHandler(walletService)
 	transferHandler := handler.NewTransferHandler(transferService)
 
-	ginEngine := routes.SetupRouter(walletHandler, transferHandler)
+	ginEngine := routes.SetupRouter(walletHandler, transferHandler, cfg.AllowedOrigins)
 
 	// Standard HTTP Server with timeouts wrapping Gin engine
 	srv := &http.Server{

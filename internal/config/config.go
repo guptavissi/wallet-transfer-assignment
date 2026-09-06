@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -15,6 +16,7 @@ type Config struct {
 	DatabaseURL          string
 	IdempotencyLockTTL   time.Duration
 	IdempotencyRetention time.Duration
+	AllowedOrigins       []string
 }
 
 func LoadConfig() *Config {
@@ -30,8 +32,15 @@ func LoadConfig() *Config {
 		IdempotencyRetention: getSecondsEnv("IDEMPOTENCY_RETENTION_SECONDS", 24*time.Hour),
 		// IdempotencyLockTTL:   getDurationEnv("IDEMPOTENCY_LOCK_TTL", 30*time.Second),
 		// IdempotencyRetention: getDurationEnv("IDEMPOTENCY_RETENTION", 24*time.Hour),
+		AllowedOrigins: getSliceEnv("ALLOWED_ORIGINS", []string{"http://localhost:3000", "http://localhost:8080"}),
 	}
-	slog.Info("configuration loaded", "port", cfg.Port, "environment", cfg.Environment, "idempotency_lock_ttl", cfg.IdempotencyLockTTL, "idempotency_retention", cfg.IdempotencyRetention)
+	slog.Info("configuration loaded",
+		"port", cfg.Port,
+		"environment", cfg.Environment,
+		"idempotency_lock_ttl", cfg.IdempotencyLockTTL,
+		"idempotency_retention", cfg.IdempotencyRetention,
+		"allowed_origins", cfg.AllowedOrigins,
+	)
 	return cfg
 }
 
@@ -40,6 +49,24 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func getSliceEnv(key string, fallback []string) []string {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return fallback
+	}
+	var items []string
+	for _, item := range strings.Split(valStr, ",") {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	if len(items) == 0 {
+		return fallback
+	}
+	return items
 }
 
 func getSecondsEnv(key string, fallback time.Duration) time.Duration {

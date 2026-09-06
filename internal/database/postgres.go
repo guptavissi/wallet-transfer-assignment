@@ -4,19 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func ConnectDB(connStr string) *sql.DB {
+// ConnectDB establishes the PostgreSQL connection pool with production defaults.
+func ConnectDB(connStr string) (*sql.DB, error) {
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
-		log.Fatalf("Failed to open DB: %v", err)
+		return nil, fmt.Errorf("failed to open db connection: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
+	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
@@ -24,9 +25,10 @@ func ConnectDB(connStr string) *sql.DB {
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		log.Fatalf("Could not ping database: %v", err)
+		_ = db.Close()
+		return nil, fmt.Errorf("failed pinging database: %w", err)
 	}
 
-	fmt.Println("Database connected and schema initialized!")
-	return db
+	slog.Info("connected to postgresql successfully")
+	return db, nil
 }
