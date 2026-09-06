@@ -135,3 +135,60 @@ ENVIRONMENT=development
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/walletDB?sslmode=disable
 IDEMPOTENCY_LOCK_TTL_SECONDS=30
 IDEMPOTENCY_RETENTION_SECONDS=86400
+
+# CURLS
+Before using curls make sure schemas are created using the migration scripts in migrations\1_init_schema.setup.sql
+
+# 1. Create Wallet 1 (100.00)
+curl -s -X POST "http://localhost:8080/api/v1/wallets" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "Vishal",
+    "initialBalance": "100.00",
+    "status": "ACTIVE"
+  }'
+
+# 2. Create Wallet 2 (20.00)
+curl -s -X POST "http://localhost:8080/api/v1/wallets" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "Sri",
+    "initialBalance": "20.00",
+    "status": "ACTIVE"
+  }'
+
+# 3. Execute Transfer (25.00 from Vishal to Sri)
+curl -s -X POST "http://localhost:8080/api/v1/transfers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "tx_key_001",
+    "fromWalletId": "Vishal",
+    "toWalletId": "Sri",
+    "amount": "25.00"
+  }'
+
+# 4. Idempotent Replay (Identical key & payload -> Cached response)
+curl -s -X POST "http://localhost:8080/api/v1/transfers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "tx_key_001",
+    "fromWalletId": "Vishal",
+    "toWalletId": "Sri",
+    "amount": "25.00"
+  }'
+
+# 5. Tampered Payload with Same Key (Fails with HTTP 400)
+curl -i -s -X POST "http://localhost:8080/api/v1/transfers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "tx_key_001",
+    "fromWalletId": "Vishal",
+    "toWalletId": "Sri",
+    "amount": "50.00"
+  }'
+
+# 6. Fetch Wallet 1 Statement (75.00 balance + DEBIT entry)
+curl -s -X GET "http://localhost:8080/api/v1/wallets/Vishal/statement"
+
+# 7. Fetch Wallet 2 Statement (45.00 balance + CREDIT entry)
+curl -s -X GET "http://localhost:8080/api/v1/wallets/Sri/statement"
