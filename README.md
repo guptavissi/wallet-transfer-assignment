@@ -56,9 +56,9 @@ Defined in: migrations/1_init_schema.setup.sql
 
 ### Tables
 * wallets: Stores account state (id, balance, status, created_at, updated_at). Balances are stored as 64-bit integers (BIGINT) representing minor units (cents) to eliminate floating-point drift.
-* transfers: Stores money movement records (id, from_wallet_id, to_wallet_id, amount, status, idempotency_key, created_at).
+* transfers: Stores money movement records (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status, failure_reason, created_at, updated_at).
 * ledger_entries: Immutable general ledger capturing every debit and credit event (id, wallet_id, transfer_id, type, amount, balance_before, balance_after, created_at).
-* idempotency_records: Manages execution locks and cached responses (key, payload_hash, status, response_code, response_body, created_at, updated_at).
+* idempotency_records: Manages execution locks and cached responses (key, request_hash, status, response_code, response_body, created_at, updated_at).
 
 ### Constraints & Invariants
 * Non-Negative Balance: CHECK (balance >= 0) on wallets guarantees that balance overdrafts are impossible at the database engine level.

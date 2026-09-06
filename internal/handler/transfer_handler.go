@@ -37,15 +37,15 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 		}
 
 		// Do not send internal database / driver errors to the client
-		if statusCode == http.StatusInternalServerError {
+		if statusCode >= http.StatusInternalServerError {
 			c.JSON(statusCode, gin.H{"error": "transfer processing failed"})
 			slog.ErrorContext(c.Request.Context(), "create transfer request failed", "from_wallet_id", req.FromWalletID, "to_wallet_id", req.ToWalletID, "status", statusCode, "error", err)
 			return
 		}
 
-		// Renders domain errors and replayed idempotent failures (400, 403, 404, 409)
+		// Renders domain errors and replayed idempotent failures (400, 403, 404, 409) as warnings
 		c.JSON(statusCode, gin.H{"error": err.Error()})
-		slog.ErrorContext(c.Request.Context(), "create transfer request rejected", "from_wallet_id", req.FromWalletID, "to_wallet_id", req.ToWalletID, "status", statusCode, "error", err)
+		slog.WarnContext(c.Request.Context(), "create transfer request rejected", "from_wallet_id", req.FromWalletID, "to_wallet_id", req.ToWalletID, "status", statusCode, "reason", err.Error())
 		return
 	}
 
