@@ -92,11 +92,13 @@ func (r *idempotencyRepository) TryAcquire(
 		if rec.Status != model.IdempotencyStatusExpired {
 			// Persist the status transition to EXPIRED in PostgreSQL
 			expireQuery := `
-				UPDATE idempotency_records
-				SET status = $1, updated_at = CURRENT_TIMESTAMP
-				WHERE key = $2
-			`
-			_, _ = r.db.ExecContext(ctx, expireQuery, model.IdempotencyStatusExpired, key)
+                UPDATE idempotency_records
+                SET status = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE key = $2
+            `
+			if _, err := r.db.ExecContext(ctx, expireQuery, model.IdempotencyStatusExpired, key); err != nil {
+				slog.WarnContext(ctx, "failed to transition expired idempotency record", "idempotency_key", key, "error", err)
+			}
 		}
 		return nil, false, apperror.ErrIdempotencyKeyExpired
 	}
@@ -132,11 +134,20 @@ func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, stat
 		SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
 		WHERE key = $4
 	`
-	_, err := r.db.ExecContext(ctx, query, status, code, body, key)
+	res, err := r.db.ExecContext(ctx, query, status, code, body, key)
 	if err != nil {
 		slog.ErrorContext(ctx, "idempotency repository save result failed", "idempotency_key", key, "error", err)
 		return fmt.Errorf("failed saving idempotency outcome: %w", err)
 	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed checking rows affected for key %s: %w", key, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("idempotency record update affected %d rows; expected 1 for key %s", rows, key)
+	}
+
 	slog.DebugContext(ctx, "idempotency repository save result completed", "idempotency_key", key)
 	return nil
 }

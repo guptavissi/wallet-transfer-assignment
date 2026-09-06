@@ -126,21 +126,29 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 
 	// Update wallet balances
 	deductQuery := `
-		UPDATE wallets 
-		SET balance = balance - $1 
-		WHERE id = $2
-	`
-	if _, err := tx.ExecContext(ctx, deductQuery, transfer.Amount, transfer.FromWalletID); err != nil {
+        UPDATE wallets 
+        SET balance = balance - $1 
+        WHERE id = $2
+    `
+	deductRes, err := tx.ExecContext(ctx, deductQuery, transfer.Amount, transfer.FromWalletID)
+	if err != nil {
 		return fmt.Errorf("failed to deduct balance: %w", err)
+	}
+	if rows, err := deductRes.RowsAffected(); err != nil || rows != 1 {
+		return fmt.Errorf("deduct balance affected %d rows; expected 1 for wallet %s", rows, transfer.FromWalletID)
 	}
 
 	creditQuery := `
-		UPDATE wallets 
-		SET balance = balance + $1 
-		WHERE id = $2
-	`
-	if _, err := tx.ExecContext(ctx, creditQuery, transfer.Amount, transfer.ToWalletID); err != nil {
+        UPDATE wallets 
+        SET balance = balance + $1 
+        WHERE id = $2
+    `
+	creditRes, err := tx.ExecContext(ctx, creditQuery, transfer.Amount, transfer.ToWalletID)
+	if err != nil {
 		return fmt.Errorf("failed to credit balance: %w", err)
+	}
+	if rows, err := creditRes.RowsAffected(); err != nil || rows != 1 {
+		return fmt.Errorf("credit balance affected %d rows; expected 1 for wallet %s", rows, transfer.ToWalletID)
 	}
 
 	// Record transfer execution

@@ -37,7 +37,7 @@ func setupTestRouter(t *testing.T) (*gin.Engine, *sql.DB) {
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, db.PingContext(ctx), "Postgres must be reachable for integration testing")
 

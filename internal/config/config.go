@@ -25,7 +25,7 @@ func LoadConfig() *Config {
 	cfg := &Config{
 		Port:                 getEnv("PORT", "8080"),
 		Environment:          getEnv("ENVIRONMENT", "development"),
-		DatabaseURL:          getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/wallet_db?sslmode=disable"),
+		DatabaseURL:          getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/walletDB?sslmode=disable"),
 		IdempotencyLockTTL:   getSecondsEnv("IDEMPOTENCY_LOCK_TTL_SECONDS", 30*time.Second),
 		IdempotencyRetention: getSecondsEnv("IDEMPOTENCY_RETENTION_SECONDS", 24*time.Hour),
 		// IdempotencyLockTTL:   getDurationEnv("IDEMPOTENCY_LOCK_TTL", 30*time.Second),
