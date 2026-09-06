@@ -181,13 +181,22 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		SET status = $1, response_code = $2, response_body = $3 
 		WHERE key = $4
 	`
-	if _, err := tx.ExecContext(ctx, updateIdempotencyQuery,
+	res, err := tx.ExecContext(ctx, updateIdempotencyQuery,
 		model.IdempotencyStatusCompleted,
 		http.StatusCreated,
 		responseBody,
 		transfer.IdempotencyKey,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("failed to update idempotency record to completed: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to retrieve affected rows for idempotency record: %w", err)
+	}
+
+	if rowsAffected != 1 {
+		return fmt.Errorf("idempotency record update affected %d rows; expected exactly 1 for key %s", rowsAffected, transfer.IdempotencyKey)
 	}
 
 	// Commit all changes simultaneously

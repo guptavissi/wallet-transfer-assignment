@@ -157,13 +157,18 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 				"http_status", statusCode,
 			)
 
-			_ = s.idempotencyRepo.SaveResult(
+			if saveErr := s.idempotencyRepo.SaveResult(
 				ctx,
 				req.IdempotencyKey,
 				model.IdempotencyStatusFailed,
 				statusCode,
 				err.Error(),
-			)
+			); saveErr != nil {
+				logger.ErrorContext(ctx, "failed to persist idempotency failed status",
+					"error", saveErr,
+				)
+				return nil, http.StatusInternalServerError, fmt.Errorf("transfer rejected with %w, but failed persisting idempotency state: %v", err, saveErr)
+			}
 			return nil, statusCode, err
 		}
 

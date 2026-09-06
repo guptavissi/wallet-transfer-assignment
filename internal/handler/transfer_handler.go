@@ -36,7 +36,7 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 			statusCode = http.StatusInternalServerError
 		}
 
-		// Donnot send internal database / driver errors to the client
+		// Do not send internal database / driver errors to the client
 		if statusCode == http.StatusInternalServerError {
 			c.JSON(statusCode, gin.H{"error": "transfer processing failed"})
 			slog.ErrorContext(c.Request.Context(), "create transfer request failed", "from_wallet_id", req.FromWalletID, "to_wallet_id", req.ToWalletID, "status", statusCode, "error", err)

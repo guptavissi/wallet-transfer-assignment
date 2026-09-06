@@ -49,8 +49,7 @@ Implemented a concurrent, transactional wallet-to-wallet transfer service in Go 
    * Framework scaffolding: Structured a layered Gin skeleton with native PostgreSQL drivers (pgx).
    * Test automation: Developed behavioral integration tests (tests/transfer_test.go) and shell verification scripts (scripts/test_e2e.sh).
    * Environment & edge-case debugging: Resolved Windows Git Bash newline artifacts (CRLF to LF), fixed validation tags for wallet identifiers (underscores only), and added mathematical overflow guards on currency conversions.
-   * code review
-   
+   * Code review: Addressed automated code review feedback regarding transactional row checks, idempotency persistence guarantees, and test resilience.
 
 ## Schema Design
 Defined in: migrations/1_init_schema.setup.sql
@@ -59,7 +58,7 @@ Defined in: migrations/1_init_schema.setup.sql
 * wallets: Stores account state (id, balance, status, created_at, updated_at). Balances are stored as 64-bit integers (BIGINT) representing minor units (cents) to eliminate floating-point drift.
 * transfers: Stores money movement records (id, from_wallet_id, to_wallet_id, amount, status, idempotency_key, created_at).
 * ledger_entries: Immutable general ledger capturing every debit and credit event (id, wallet_id, transfer_id, type, amount, balance_before, balance_after, created_at).
-* idempotency_records: Manages execution locks and cached responses (idempotency_key, payload_hash, status, response_code, response_body, locked_until, created_at).
+* idempotency_records: Manages execution locks and cached responses (key, payload_hash, status, response_code, response_body, created_at, updated_at).
 
 ### Constraints & Invariants
 * Non-Negative Balance: CHECK (balance >= 0) on wallets guarantees that balance overdrafts are impossible at the database engine level.
@@ -70,36 +69,26 @@ Defined in: migrations/1_init_schema.setup.sql
 ### Indexes
 * wallets(id): Primary key index for O(1) row lookups and locks.
 * ledger_entries(wallet_id, created_at DESC): Composite index optimized for rapid wallet statement generation and audit history scans.
-* idempotency_records(idempotency_key): Primary key index for instant lease checks and replay lookups.
+* idempotency_records(key): Primary key index for instant lease checks and replay lookups.
 
 ## Idempotency Strategy
-* Payload Hashing: On every transfer request, the service normalizes the incoming payload and computes its SHA-256 hash.
-* Lease Acquisition: The service inserts a lease record into idempotency_records with an expiration window (locked_until).
-* First Request: Lease is acquired; the transfer executes atomically within a database transaction. Upon commit, the final HTTP status code and response payload are persisted, and the status transitions to COMPLETED.
-* Identical Replay: If an incoming request matches an existing COMPLETED key and has the identical payload hash, the transaction is bypassed and the cached response body and HTTP status code are served immediately.
-* Tamper Protection: If a request reuses an existing idempotency_key but the SHA-256 payload hash differs, execution is immediately aborted with 400 Bad Request (idempotency key already used with different payload).
-* In-Flight Conflict: If a duplicate arrives while a request is actively processing (locked_until > now()), the system rejects concurrent mutation to prevent race conditions.
-
 Explain how duplicate requests are handled safely.
-Payload Fingerprinting: The incoming request body is normalized, and its SHA-256 hash is computed and stored alongside the user-supplied idempotencyKey.
-
-Atomic Lease Lock: Before moving funds, the system attempts to insert a record into idempotency_records with a leased status and an active expiration (locked_until = now() + TTL).
-
-Safe Replay Without Re-Execution: If an incoming request matches an existing COMPLETED record with an identical SHA-256 payload hash, the business logic and money movement are completely bypassed. The service immediately serves the cached HTTP status code and response payload.
-
-Tamper Detection: If an existing idempotencyKey is reused with altered parameters (e.g., a changed amount or recipient), the SHA-256 hashes will mismatch. The system halts immediately with 400 Bad Request ("idempotency key already used with different payload").
-
-In-Flight Conflict Suppression: If a duplicate request arrives while the original operation is still processing within its lease window (locked_until > now()), the system rejects the second execution, preventing concurrent duplicate ledger side-effects.
+* Payload Fingerprinting: On every transfer request, the service normalizes the incoming payload, parses amounts to minor units, and computes a deterministic SHA-256 hash stored alongside the user-supplied key.
+* Atomic Lease Lock: Before moving funds, the system attempts to insert or update a record in idempotency_records with status = 'STARTED' and timestamp updated_at.
+* First Request Execution: Upon acquiring the lease, the transfer executes atomically within a database transaction. Before commit, the idempotency record is verified and transitioned to status = 'COMPLETED' with the HTTP status code and response payload cached.
+* Safe Replay Without Re-Execution: If an incoming request matches an existing COMPLETED key and has an identical SHA-256 payload hash, business logic and balance mutations are bypassed. The cached response body and HTTP status code are served immediately.
+* Tamper Detection: If an existing key is reused with altered parameters (e.g., changed amount or recipient), the SHA-256 hashes mismatch. The system halts immediately with HTTP 400 Bad Request ("idempotency key already used with different payload").
+* In-Flight Conflict Suppression: If a duplicate request arrives while an operation is actively processing (status = 'STARTED' and updated_at + TTL has not expired), the system rejects concurrent mutation with HTTP 409 Conflict.
 
 ## Concurrency Strategy
-* Pessimistic Row-Level Locking: Balances are modified within a PostgreSQL transaction using SELECT balance, status FROM wallets WHERE id = 1 FOR UPDATE.
-* Deterministic Lock Ordering: To eliminate SQL deadlocks when opposite transfers occur concurrently (e.g., Alice -> Bob while Bob -> Alice), row locks are always acquired in alphabetical order:
+* Pessimistic Row-Level Locking (FOR UPDATE): Balances are modified within a PostgreSQL transaction using `SELECT balance, status FROM wallets WHERE id IN (1, 2) ORDER BY id FOR UPDATE`. This ensures only one transfer can read and mutate a wallet's balance at any given moment; subsequent parallel attempts must wait until the active transaction commits or rolls back.
+* Deterministic Lock Ordering: To eliminate SQL deadlocks when opposite transfers occur concurrently (e.g., Alice -> Bob while Bob -> Alice), row locks are always acquired in strict lexicographical order:
   firstID, secondID := fromID, toID
   if firstID > secondID {
       firstID, secondID = toID, fromID
   }
   // Lock firstID, then lock secondID
-  This eliminates circular wait conditions, mathematically guaranteeing zero deadlocks across high-concurrency transfers.
+  This eliminates circular wait states, mathematically guaranteeing zero deadlocks across high-concurrency transfers.
 * Double-Spending Prevention: Database row-level locks serialize balance reads and mutations for any given wallet. Combined with the engine-level CHECK (balance >= 0) constraint, no balance can be debited beyond its available funds.
 * High-Concurrency Verification: Verified via TestTransfer_HighConcurrencyNoDoubleSpend, where 10 concurrent goroutines attempt to spend from a shared balance simultaneously (100 initial balance, 10 transfers of 15). Exactly 6 succeed (90 spent) and 4 fail with insufficient balance, preserving the exact final database invariants.
 
@@ -107,18 +96,25 @@ Explain how you prevent race conditions and double spending.
 Pessimistic Row-Level Locking (FOR UPDATE): Before checking balances or applying debits/credits, the transaction locks both participating wallet records via SELECT balance, status FROM wallets WHERE id = 1 FOR UPDATE. This ensures only one transfer can read and mutate a wallet's balance at any given moment; subsequent parallel attempts must wait until the active transaction commits or rolls back.
 Deterministic Lexicographical Lock Ordering: To prevent deadlocks when opposing transfers occur concurrently (e.g., Alice transferring to Bob while Bob transfers to Alice), wallets are locked in strict alphabetical order
 
+## Environment Configuration
+Set the following environment variables before starting the server (Note env will change as per your system):
+PORT=8080
+ENVIRONMENT=development
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/walletDB?sslmode=disable
+IDEMPOTENCY_LOCK_TTL_SECONDS=30
+IDEMPOTENCY_RETENTION_SECONDS=86400
+
 ## How to Run
-1. Ensure PostgreSQL is running and initialize the database:
+1. Ensure PostgreSQL is running and initialize the database schema:
    createdb walletDB
    psql -d walletDB -f migrations/1_init_schema.setup.sql
 2. Start the API server:
-   export DATABASE_URL="postgres://postgres:postgres@localhost:5432/walletDB?sslmode=disable"
-   export PORT=8080
-   go run cmd/api/main.go
+   go run cmd/server/main.go
 
 ## How to Test
 * Integration Tests: Runs the suite covering transfer execution, idempotency replays, payload tamper detection, insufficient balances, and concurrent race conditions:
-  env:TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/walletDB_test?sslmode=disable"; go test -v ./tests/...
+  export TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/walletDB_test?sslmode=disable"
+  go test -v ./tests/...
 * End-to-End Suite: Runs client-side verification with formatted JSON assertions against a live server:
   chmod +x scripts/test_e2e.sh
   ./scripts/test_e2e.sh
@@ -129,17 +125,10 @@ Deterministic Lexicographical Lock Ordering: To prevent deadlocks when opposing 
 * Identifier Formatting: Wallet IDs enforce an alphanumeric and underscore character set (^[a-zA-Z0-9_]+) via custom Gin binding validators; hyphens are disallowed.
 * Local Test Infrastructure: Tests run against a live PostgreSQL instance rather than an in-memory SQL mock to validate row-level locking semantics (FOR UPDATE), isolation boundaries, and check constraints directly.
 
-# Required env:
-PORT=8080
-ENVIRONMENT=development
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/walletDB?sslmode=disable
-IDEMPOTENCY_LOCK_TTL_SECONDS=30
-IDEMPOTENCY_RETENTION_SECONDS=86400
+## API Usage & cURL Examples
+Before using cURL examples, ensure the database schema has been initialized via migrations/1_init_schema.setup.sql.
 
-# CURLS
-Before using curls make sure schemas are created using the migration scripts in migrations\1_init_schema.setup.sql
-
-# 1. Create Wallet 1 (100.00)
+### 1. Create Wallet 1 (100.00)
 curl -s -X POST "http://localhost:8080/api/v1/wallets" \
   -H "Content-Type: application/json" \
   -d '{
@@ -148,7 +137,7 @@ curl -s -X POST "http://localhost:8080/api/v1/wallets" \
     "status": "ACTIVE"
   }'
 
-# 2. Create Wallet 2 (20.00)
+### 2. Create Wallet 2 (20.00)
 curl -s -X POST "http://localhost:8080/api/v1/wallets" \
   -H "Content-Type: application/json" \
   -d '{
@@ -157,7 +146,7 @@ curl -s -X POST "http://localhost:8080/api/v1/wallets" \
     "status": "ACTIVE"
   }'
 
-# 3. Execute Transfer (25.00 from Vishal to Sri)
+### 3. Execute Transfer (25.00 from Vishal to Sri)
 curl -s -X POST "http://localhost:8080/api/v1/transfers" \
   -H "Content-Type: application/json" \
   -d '{
@@ -167,7 +156,7 @@ curl -s -X POST "http://localhost:8080/api/v1/transfers" \
     "amount": "25.00"
   }'
 
-# 4. Idempotent Replay (Identical key & payload -> Cached response)
+### 4. Idempotent Replay (Identical Key & Payload -> Cached Response)
 curl -s -X POST "http://localhost:8080/api/v1/transfers" \
   -H "Content-Type: application/json" \
   -d '{
@@ -177,7 +166,7 @@ curl -s -X POST "http://localhost:8080/api/v1/transfers" \
     "amount": "25.00"
   }'
 
-# 5. Tampered Payload with Same Key (Fails with HTTP 400)
+### 5. Tampered Payload with Same Key (Fails with HTTP 400)
 curl -i -s -X POST "http://localhost:8080/api/v1/transfers" \
   -H "Content-Type: application/json" \
   -d '{
@@ -187,8 +176,15 @@ curl -i -s -X POST "http://localhost:8080/api/v1/transfers" \
     "amount": "50.00"
   }'
 
-# 6. Fetch Wallet 1 Statement (75.00 balance + DEBIT entry)
+### 6. Fetch Wallet 1 Statement (75.00 balance + DEBIT entry)
 curl -s -X GET "http://localhost:8080/api/v1/wallets/Vishal/statement"
 
-# 7. Fetch Wallet 2 Statement (45.00 balance + CREDIT entry)
+### 7. Fetch Wallet 2 Statement (45.00 balance + CREDIT entry)
 curl -s -X GET "http://localhost:8080/api/v1/wallets/Sri/statement"
+
+## Checklist
+- [x] Tests pass
+- [x] Lint passes
+- [x] Format check passes
+- [x] README or notes updated
+- [x] PR description explains schema, idempotency, and concurrency

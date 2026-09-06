@@ -33,23 +33,29 @@ curl -s -f -X POST "${BASE_URL}/wallets" \
 
 # 2. Execute Transfer
 echo -e "\n3. Executing Transfer (\$25.00 from ${WALLET_1} to ${WALLET_2})..."
-TRANSFER_RESP=$(curl -s -X POST "${BASE_URL}/transfers" \
+TRANSFER_RESP=$(curl -s -f -X POST "${BASE_URL}/transfers" \
   -H "Content-Type: application/json" \
   -d "{\"idempotencyKey\": \"${IDEMP_KEY}\", \"fromWalletId\": \"${WALLET_1}\", \"toWalletId\": \"${WALLET_2}\", \"amount\": \"25.00\"}")
 echo "${TRANSFER_RESP}" | format_json
 
 # 3. Test Idempotency (Repeat exact same transfer call)
 echo -e "\n4. Retrying with IDENTICAL Idempotency Key (Expect cached replay)..."
-IDEMP_REPLAY=$(curl -s -X POST "${BASE_URL}/transfers" \
+IDEMP_REPLAY=$(curl -s -f -X POST "${BASE_URL}/transfers" \
   -H "Content-Type: application/json" \
   -d "{\"idempotencyKey\": \"${IDEMP_KEY}\", \"fromWalletId\": \"${WALLET_1}\", \"toWalletId\": \"${WALLET_2}\", \"amount\": \"25.00\"}")
 echo "${IDEMP_REPLAY}" | format_json
 
-# 4. Test Idempotency Tamper Protection
+# 4. Test Idempotency Tamper Protection (Assert 400 Bad Request)
 echo -e "\n5. Retrying with SAME key but TAMPERED amount (\$50.00) (Expect 400 Bad Request)..."
-curl -s -w "\nHTTP Status: %{http_code}\n" -X POST "${BASE_URL}/transfers" \
+TAMPER_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/transfers" \
   -H "Content-Type: application/json" \
-  -d "{\"idempotencyKey\": \"${IDEMP_KEY}\", \"fromWalletId\": \"${WALLET_1}\", \"toWalletId\": \"${WALLET_2}\", \"amount\": \"50.00\"}"
+  -d "{\"idempotencyKey\": \"${IDEMP_KEY}\", \"fromWalletId\": \"${WALLET_1}\", \"toWalletId\": \"${WALLET_2}\", \"amount\": \"50.00\"}")
+
+echo "HTTP Status: ${TAMPER_STATUS}"
+if [ "${TAMPER_STATUS}" != "400" ]; then
+  echo "Assertion failed: Expected HTTP 400 on tampered payload, got ${TAMPER_STATUS}"
+  exit 1
+fi
 
 # 5. Verify Statement & Ledger Open/Close Balances
 echo -e "\n6. Fetching Statement for ${WALLET_1}..."
