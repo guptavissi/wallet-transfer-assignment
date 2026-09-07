@@ -17,6 +17,7 @@ var (
 	ErrWalletClosed        = errors.New("wallet is closed")
 	ErrWalletAlreadyExists = errors.New("wallet already exists")
 	ErrWalletIDRequired    = errors.New("wallet id is required")
+	ErrBalanceOverflow     = errors.New("destination balance overflow limit reached")
 
 	// Idempotency errors
 	ErrIdempotencyKeyRequired = errors.New("idempotency key is required")
