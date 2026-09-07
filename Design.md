@@ -1,7 +1,10 @@
 ## 1. Overview
-This service provides an ACID-compliant HTTP API for wallet-to-wallet transfers with distributed idempotency, double-entry ledger auditing, deterministic deadlock prevention, and consistent error handling.
+This service provides an ACID-compliant HTTP API for wallet-to-wallet transfers with distributed idempotency, double-entry ledger auditing, deterministic deadlock prevention, and consistent error handling. 
+
 Language: Golang
+
 Framework: Gin
+
 Database: Postgres
 
 ---
