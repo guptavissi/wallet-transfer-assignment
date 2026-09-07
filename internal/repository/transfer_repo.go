@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -92,10 +93,15 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 			failureReason,
 		); err != nil {
 			slog.ErrorContext(ctx, "failed to insert failed transfer record", "error", err)
-			return domainErr
+			return fmt.Errorf("failed to insert failed transfer record: %w", err)
 		}
 
-		errPayload := fmt.Sprintf(`{"error":"%s"}`, domainErr.Error())
+		errPayloadBytes, err := json.Marshal(map[string]string{"error": domainErr.Error()})
+		if err != nil {
+			slog.ErrorContext(ctx, "failed to marshal error payload for idempotency record", "error", err)
+			return fmt.Errorf("failed marshaling error payload: %w", err)
+		}
+
 		updateIdempQuery := `
 			UPDATE idempotency_records 
 			SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
@@ -104,16 +110,16 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		if _, err := tx.ExecContext(ctx, updateIdempQuery,
 			model.IdempotencyStatusFailed,
 			httpStatus,
-			errPayload,
+			string(errPayloadBytes),
 			transfer.IdempotencyKey,
 		); err != nil {
 			slog.ErrorContext(ctx, "failed to update idempotency record on failure", "error", err)
-			return domainErr
+			return fmt.Errorf("failed updating idempotency record to failed: %w", err)
 		}
 
 		if commitErr := tx.Commit(); commitErr != nil {
 			slog.ErrorContext(ctx, "failed committing failed transfer audit", "error", commitErr)
-			return domainErr
+			return fmt.Errorf("failed to commit failed transfer audit tx: %w", commitErr)
 		}
 
 		transfer.Status = model.TransferStatusFailed

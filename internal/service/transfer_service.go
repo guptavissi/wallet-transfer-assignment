@@ -96,7 +96,7 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 			"cached_code", record.ResponseCode,
 		)
 		if record.Status == model.IdempotencyStatusFailed {
-			return nil, record.ResponseCode, errors.New(record.ResponseBody)
+			return nil, record.ResponseCode, errors.New(extractErrorMessage(record.ResponseBody))
 		}
 
 		var cachedResp model.CreateTransferResponse
@@ -136,7 +136,8 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed marshaling response: %w", err)
 	}
 
-	// Execute atomic transfer in PostgreSQL
+	// Execute atomic transfer in PostgreSQL.
+	// ExecuteTransfer handles ledger writes, failure auditing, and idempotency status finalization atomically.
 	err = s.transferRepo.ExecuteTransfer(ctx, transfer, string(responseBytes))
 	if err != nil {
 		if errors.Is(err, apperror.ErrInsufficientBalance) ||
@@ -144,16 +145,12 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 			errors.Is(err, apperror.ErrSourceDebitBlocked) ||
 			errors.Is(err, apperror.ErrDestCreditBlocked) ||
 			errors.Is(err, apperror.ErrWalletFrozen) ||
-			errors.Is(err, apperror.ErrWalletClosed) {
+			errors.Is(err, apperror.ErrWalletClosed) ||
+			errors.Is(err, apperror.ErrBalanceOverflow) {
 
 			statusCode := http.StatusBadRequest
 			if errors.Is(err, apperror.ErrWalletNotFound) {
 				statusCode = http.StatusNotFound
-			} else if errors.Is(err, apperror.ErrSourceDebitBlocked) ||
-				errors.Is(err, apperror.ErrDestCreditBlocked) ||
-				errors.Is(err, apperror.ErrWalletFrozen) ||
-				errors.Is(err, apperror.ErrWalletClosed) {
-				statusCode = http.StatusForbidden
 			}
 
 			logger.WarnContext(ctx, "transfer rejected by business rules",
@@ -161,31 +158,20 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 				"http_status", statusCode,
 			)
 
-			if saveErr := s.idempotencyRepo.SaveResult(
-				ctx,
-				req.IdempotencyKey,
-				model.IdempotencyStatusFailed,
-				statusCode,
-				err.Error(),
-			); saveErr != nil {
-				logger.ErrorContext(ctx, "failed to persist idempotency failed status",
-					"error", saveErr,
-				)
-				return nil, http.StatusInternalServerError, fmt.Errorf("transfer rejected with %w, but failed persisting idempotency state: %v", err, saveErr)
-			}
+			// ExecuteTransfer has already audited the failure and updated idempotency_records atomically.
+			// Return directly to preserve identical state on idempotency replay.
 			return nil, statusCode, err
 		}
 
 		logger.ErrorContext(ctx, "system failure during transfer execution", "error", err)
 
-		// Persist a generic 500 FAILED idempotency outcome so subsequent retries
-		// get a deterministic failure without hanging behind an in-progress lock.
+		// Persist a generic 500 FAILED idempotency outcome if an unhandled infrastructure error occurs
 		if saveErr := s.idempotencyRepo.SaveResult(
 			ctx,
 			req.IdempotencyKey,
 			model.IdempotencyStatusFailed,
 			http.StatusInternalServerError,
-			"internal system error during transfer execution",
+			`{"error":"internal system error during transfer execution"}`,
 		); saveErr != nil {
 			logger.WarnContext(ctx, "failed persisting 500 idempotency outcome", "error", saveErr)
 		}
@@ -203,4 +189,16 @@ func (s *transferService) computeRequestHash(fromID, toID string, amountMinor in
 	raw := fmt.Sprintf("%s:%s:%d", fromID, toID, amountMinor)
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
+}
+
+// extractErrorMessage extracts the plain error message from a JSON payload like {"error":"..."},
+// falling back to raw body if it is not formatted as JSON.
+func extractErrorMessage(body string) string {
+	var errPayload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &errPayload); err == nil && errPayload.Error != "" {
+		return errPayload.Error
+	}
+	return body
 }

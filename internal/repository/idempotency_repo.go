@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -126,42 +127,69 @@ func (r *idempotencyRepository) TryAcquire(
 			var respCode int
 			var respBody string
 			err = tx.QueryRowContext(ctx, lockQuery, key).Scan(&currentStatus, &respCode, &respBody)
-			if err == nil {
-				// If the original transaction completed or failed right before we locked,
-				// return the newly finalized cached response rather than a spurious 409.
-				if currentStatus != model.IdempotencyStatusStarted {
-					_ = tx.Commit()
-					rec.Status = currentStatus
-					rec.ResponseCode = respCode
-					rec.ResponseBody = respBody
-					slog.InfoContext(ctx, "idempotency transaction resolved during takeover lock", "idempotency_key", key, "status", currentStatus)
-					return &rec, false, nil
+			if err != nil {
+				// Interface check for PostgreSQL error code "55P03" (lock_not_available)
+				// Compatible with lib/pq (*pq.Error) and pgx (*pgconn.PgError)
+				type pgErrorCode interface {
+					Code() string
+				}
+				type pqErrorCode interface {
+					Get(byte) string
 				}
 
-				takeoverQuery := `
-					UPDATE idempotency_records
-					SET updated_at = CURRENT_TIMESTAMP
-					WHERE key = $1 AND status = $2 AND updated_at = $3
-				`
-				updateRes, updateErr := tx.ExecContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt)
-				if updateErr != nil {
-					slog.ErrorContext(ctx, "failed updating record for lease takeover", "idempotency_key", key, "error", updateErr)
-					return nil, false, fmt.Errorf("failed executing lease takeover: %w", updateErr)
+				var pgErr pgErrorCode
+				var pqErr pqErrorCode
+				isLockNotAvailable := false
+
+				if errors.As(err, &pgErr) && pgErr.Code() == "55P03" {
+					isLockNotAvailable = true
+				} else if errors.As(err, &pqErr) && pqErr.Get('C') == "55P03" {
+					isLockNotAvailable = true
 				}
 
-				count, rowsErr := updateRes.RowsAffected()
-				if rowsErr != nil {
-					return nil, false, fmt.Errorf("failed checking rows affected on lease takeover: %w", rowsErr)
+				if isLockNotAvailable {
+					slog.DebugContext(ctx, "idempotency row lock held by active worker", "idempotency_key", key)
+					return nil, false, apperror.ErrRequestInProgress
 				}
 
-				if count == 1 {
-					if commitErr := tx.Commit(); commitErr != nil {
-						slog.ErrorContext(ctx, "failed committing lease takeover tx", "idempotency_key", key, "error", commitErr)
-						return nil, false, fmt.Errorf("failed committing lease takeover: %w", commitErr)
-					}
-					slog.InfoContext(ctx, "idempotency repository reclaimed expired lease", "idempotency_key", key)
-					return nil, true, nil
+				slog.ErrorContext(ctx, "failed probing idempotency lock", "idempotency_key", key, "error", err)
+				return nil, false, fmt.Errorf("failed probing idempotency lock: %w", err)
+			}
+
+			// If the original transaction completed or failed right before we locked,
+			// return the newly finalized cached response rather than a spurious 409.
+			if currentStatus != model.IdempotencyStatusStarted {
+				_ = tx.Commit()
+				rec.Status = currentStatus
+				rec.ResponseCode = respCode
+				rec.ResponseBody = respBody
+				slog.InfoContext(ctx, "idempotency transaction resolved during takeover lock", "idempotency_key", key, "status", currentStatus)
+				return &rec, false, nil
+			}
+
+			takeoverQuery := `
+				UPDATE idempotency_records
+				SET updated_at = CURRENT_TIMESTAMP
+				WHERE key = $1 AND status = $2 AND updated_at = $3
+			`
+			updateRes, updateErr := tx.ExecContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt)
+			if updateErr != nil {
+				slog.ErrorContext(ctx, "failed updating record for lease takeover", "idempotency_key", key, "error", updateErr)
+				return nil, false, fmt.Errorf("failed executing lease takeover: %w", updateErr)
+			}
+
+			count, rowsErr := updateRes.RowsAffected()
+			if rowsErr != nil {
+				return nil, false, fmt.Errorf("failed checking rows affected on lease takeover: %w", rowsErr)
+			}
+
+			if count == 1 {
+				if commitErr := tx.Commit(); commitErr != nil {
+					slog.ErrorContext(ctx, "failed committing lease takeover tx", "idempotency_key", key, "error", commitErr)
+					return nil, false, fmt.Errorf("failed committing lease takeover: %w", commitErr)
 				}
+				slog.InfoContext(ctx, "idempotency repository reclaimed expired lease", "idempotency_key", key)
+				return nil, true, nil
 			}
 		}
 		return nil, false, apperror.ErrRequestInProgress
