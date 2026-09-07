@@ -107,9 +107,8 @@ func (r *idempotencyRepository) TryAcquire(
 	if rec.Status == model.IdempotencyStatusStarted {
 		if time.Since(rec.UpdatedAt) > lockTTL {
 			// Attempt safe lease takeover:
-			// Use a separate short transaction with FOR UPDATE NOWAIT.
-			// If an active transfer holds the row lock, NOWAIT immediately fails without blocking,
-			// proving the original operation is still executing.
+			// Non-blocking row-level lock check (FOR UPDATE NOWAIT) ensures we do not
+			// steal a lease from a worker actively executing a long-running transaction.
 			tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 			if err != nil {
 				slog.ErrorContext(ctx, "failed starting transaction for lease takeover", "idempotency_key", key, "error", err)
@@ -118,14 +117,27 @@ func (r *idempotencyRepository) TryAcquire(
 			defer tx.Rollback()
 
 			lockQuery := `
-				SELECT status 
+				SELECT status, COALESCE(response_code, 0), COALESCE(response_body, '')
 				FROM idempotency_records 
 				WHERE key = $1 
 				FOR UPDATE NOWAIT
 			`
 			var currentStatus model.IdempotencyStatus
-			err = tx.QueryRowContext(ctx, lockQuery, key).Scan(&currentStatus)
-			if err == nil && currentStatus == model.IdempotencyStatusStarted {
+			var respCode int
+			var respBody string
+			err = tx.QueryRowContext(ctx, lockQuery, key).Scan(&currentStatus, &respCode, &respBody)
+			if err == nil {
+				// If the original transaction completed or failed right before we locked,
+				// return the newly finalized cached response rather than a spurious 409.
+				if currentStatus != model.IdempotencyStatusStarted {
+					_ = tx.Commit()
+					rec.Status = currentStatus
+					rec.ResponseCode = respCode
+					rec.ResponseBody = respBody
+					slog.InfoContext(ctx, "idempotency transaction resolved during takeover lock", "idempotency_key", key, "status", currentStatus)
+					return &rec, false, nil
+				}
+
 				takeoverQuery := `
 					UPDATE idempotency_records
 					SET updated_at = CURRENT_TIMESTAMP

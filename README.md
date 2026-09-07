@@ -52,7 +52,7 @@ Implemented a concurrent, transactional wallet-to-wallet transfer service in Go 
    * Code review: Addressed automated code review feedback regarding transactional row checks, idempotency persistence guarantees, and test resilience.
 
 ## Schema Design
-Defined in: migrations/1_init_schema.setup.sql
+Defined in: migrations/1_init_schema.setup.sql (for full details)
 
 ### Tables
 * wallets: Stores account state (id, balance, status, created_at, updated_at). Balances are stored as 64-bit integers (BIGINT) representing minor units (cents) to eliminate floating-point drift.

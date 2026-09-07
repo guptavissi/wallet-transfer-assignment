@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     amount BIGINT NOT NULL CHECK (amount > 0),
     balance_before BIGINT NOT NULL CHECK (balance_before >= 0),
     balance_after BIGINT NOT NULL CHECK (balance_after >= 0),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_transfer_wallet_type UNIQUE (transfer_id, wallet_id, type)
 );
 
