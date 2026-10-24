@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -164,11 +165,17 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 		}
 
 		// Infrastructure error (connection drop, query timeout, deadlock, etc.).
-		// DO NOT call SaveResult to mark FAILED/500:
-		// 1. Transient errors must not be cached permanently, allowing safe client retries.
-		// 2. A lagging worker whose lease was taken over must never overwrite a COMPLETED record.
-		// Leaving the record in 'STARTED' allows lease takeover after LockTTL or retries.
-		logger.ErrorContext(ctx, "system failure during transfer execution; skipping idempotency finalization", "error", err)
+		logger.ErrorContext(ctx, "system failure during transfer execution; releasing lease for immediate retry", "error", err)
+
+		// Release the lease by resetting updated_at to the epoch so immediate client retries
+		// are not blocked with HTTP 409 Conflict while waiting for LockTTL to elapse.
+		// A detached context ensures lease release completes even if the request context was canceled.
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		if relErr := s.idempotencyRepo.ReleaseLease(releaseCtx, req.IdempotencyKey); relErr != nil {
+			logger.WarnContext(ctx, "failed releasing idempotency lease after system failure", "error", relErr)
+		}
 
 		return nil, http.StatusInternalServerError, fmt.Errorf("transfer execution failed: %w", err)
 	}
