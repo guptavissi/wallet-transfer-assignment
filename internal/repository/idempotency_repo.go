@@ -14,14 +14,10 @@ import (
 	"wallet-transfer-service/internal/model"
 )
 
-// var (
-// 	ErrRequestInProgress = errors.New("request currently in progress, please retry shortly")
-// 	ErrPayloadMismatch   = errors.New("idempotency key already used with different payload")
-// )
-
 type IdempotencyRepository interface {
 	TryAcquire(ctx context.Context, key, requestHash string, lockTTL, retention time.Duration) (*model.IdempotencyRecord, bool, error)
 	SaveResult(ctx context.Context, key string, status model.IdempotencyStatus, code int, body string) error
+	ReleaseLease(ctx context.Context, key string) error
 }
 
 type idempotencyRepository struct {
@@ -202,8 +198,7 @@ func (r *idempotencyRepository) TryAcquire(
 func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, status model.IdempotencyStatus, code int, body string) error {
 	slog.DebugContext(ctx, "idempotency repository save result started", "idempotency_key", key, "status", status, "response_code", code)
 
-	// Status guard: ONLY transition rows that are currently in 'STARTED'.
-	// This prevents a lagging or failing worker from overwriting a COMPLETED record.
+	// Guarded transition: only update if the record is currently in STARTED
 	query := `
 		UPDATE idempotency_records
 		SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
@@ -221,26 +216,52 @@ func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, stat
 	}
 
 	if rows == 0 {
-		// The record was not in STARTED state. Check if another worker already finalized it.
 		var currentStatus model.IdempotencyStatus
 		checkQuery := `SELECT status FROM idempotency_records WHERE key = $1`
-		if scanErr := r.db.QueryRowContext(ctx, checkQuery, key).Scan(&currentStatus); scanErr == nil {
-			if currentStatus == model.IdempotencyStatusCompleted {
-				slog.WarnContext(ctx, "idempotency record already completed by another worker; ignoring overwrite attempt",
-					"idempotency_key", key,
-					"attempted_status", status,
-				)
-				return nil
+		checkErr := r.db.QueryRowContext(ctx, checkQuery, key).Scan(&currentStatus)
+		if checkErr != nil {
+			if errors.Is(checkErr, sql.ErrNoRows) {
+				return fmt.Errorf("idempotency record not found for key %s: %w", key, sql.ErrNoRows)
 			}
+			return fmt.Errorf("failed checking idempotency record status for key %s: %w", key, checkErr)
 		}
 
-		slog.WarnContext(ctx, "idempotency record status transition skipped; record not in STARTED state",
-			"idempotency_key", key,
-			"attempted_status", status,
-		)
-		return nil
+		// Row exists and is already in a terminal/finalized state (completed or failed by another worker)
+		if currentStatus == model.IdempotencyStatusCompleted || currentStatus == model.IdempotencyStatusFailed {
+			slog.WarnContext(ctx, "idempotency record already finalized by another worker",
+				"idempotency_key", key,
+				"current_status", currentStatus,
+				"attempted_status", status,
+			)
+			return nil
+		}
+
+		// Row exists but is in an unfinalizable state (e.g. EXPIRED)
+		return fmt.Errorf("idempotency record update affected 0 rows for key %s: expected status %s, current status is %s",
+			key, model.IdempotencyStatusStarted, currentStatus)
 	}
 
 	slog.DebugContext(ctx, "idempotency repository save result completed", "idempotency_key", key)
+	return nil
+}
+
+// ReleaseLease resets updated_at to the Unix epoch for records still in STARTED status.
+// This allows immediate client retries following an infrastructure failure to acquire
+// the lease via takeover without waiting for lockTTL to expire or encountering a 409 Conflict.
+func (r *idempotencyRepository) ReleaseLease(ctx context.Context, key string) error {
+	slog.DebugContext(ctx, "idempotency repository release lease started", "idempotency_key", key)
+
+	query := `
+		UPDATE idempotency_records
+		SET updated_at = '1970-01-01 00:00:00Z'
+		WHERE key = $1 AND status = $2
+	`
+	_, err := r.db.ExecContext(ctx, query, key, model.IdempotencyStatusStarted)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed releasing idempotency lease", "idempotency_key", key, "error", err)
+		return fmt.Errorf("failed releasing idempotency lease: %w", err)
+	}
+
+	slog.DebugContext(ctx, "idempotency repository lease released successfully", "idempotency_key", key)
 	return nil
 }
