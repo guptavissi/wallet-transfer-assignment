@@ -46,6 +46,7 @@ func RegisterCustomValidators() {
 // HandleValidationError translates binding errors into a field-by-field JSON map
 func HandleValidationError(c *gin.Context, err error) {
 	slog.WarnContext(c.Request.Context(), "request validation failed", "path", c.Request.URL.Path, "error", err)
+
 	var ve validator.ValidationErrors
 	if errors.As(err, &ve) {
 		out := make(map[string]string)
@@ -59,9 +60,11 @@ func HandleValidationError(c *gin.Context, err error) {
 		return
 	}
 
+	// Non-validator failure (e.g. malformed JSON, unmarshal type mismatch, empty body).
+	// Technical details remain in the slog output above; return a sanitized message to the client.
 	c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 		"error":   "invalid_request",
-		"details": err.Error(),
+		"details": "Malformed request payload or invalid data types",
 	})
 }
 
