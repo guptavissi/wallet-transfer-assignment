@@ -17,7 +17,7 @@ import (
 type IdempotencyRepository interface {
 	TryAcquire(ctx context.Context, key, requestHash string, lockTTL, retention time.Duration) (*model.IdempotencyRecord, bool, error)
 	SaveResult(ctx context.Context, key string, status model.IdempotencyStatus, code int, body string) error
-	ReleaseLease(ctx context.Context, key string) error
+	ReleaseLease(ctx context.Context, key string, acquiredAt time.Time) error
 }
 
 type idempotencyRepository struct {
@@ -37,27 +37,27 @@ func (r *idempotencyRepository) TryAcquire(
 ) (*model.IdempotencyRecord, bool, error) {
 	slog.DebugContext(ctx, "idempotency repository acquire started", "idempotency_key", key)
 
-	// Atomic insert for first-time callers
+	// Atomic insert returning updated_at so the caller receives the lease token
 	insertQuery := `
 		INSERT INTO idempotency_records (key, request_hash, status, created_at, updated_at)
 		VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT (key) DO NOTHING
+		RETURNING updated_at
 	`
-	res, err := r.db.ExecContext(ctx, insertQuery, key, requestHash, model.IdempotencyStatusStarted)
-	if err != nil {
+	var acquiredAt time.Time
+	err := r.db.QueryRowContext(ctx, insertQuery, key, requestHash, model.IdempotencyStatusStarted).Scan(&acquiredAt)
+	if err == nil {
+		slog.DebugContext(ctx, "idempotency repository lease acquired", "idempotency_key", key)
+		return &model.IdempotencyRecord{
+			Key:         key,
+			RequestHash: requestHash,
+			Status:      model.IdempotencyStatusStarted,
+			UpdatedAt:   acquiredAt,
+		}, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
 		slog.ErrorContext(ctx, "idempotency repository insert failed", "idempotency_key", key, "error", err)
 		return nil, false, fmt.Errorf("failed to insert idempotency record: %w", err)
-	}
-
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return nil, false, fmt.Errorf("failed checking rows affected: %w", err)
-	}
-
-	// First time caller acquired the lease
-	if rowsAffected == 1 {
-		slog.DebugContext(ctx, "idempotency repository lease acquired", "idempotency_key", key)
-		return nil, true, nil
 	}
 
 	// Row exists: Read existing record
@@ -105,9 +105,6 @@ func (r *idempotencyRepository) TryAcquire(
 	// Active lease / crash recovery check
 	if rec.Status == model.IdempotencyStatusStarted {
 		if time.Since(rec.UpdatedAt) > lockTTL {
-			// Attempt safe lease takeover:
-			// Non-blocking row-level lock check (FOR UPDATE NOWAIT) ensures we do not
-			// steal a lease from a worker actively executing a long-running transaction.
 			tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 			if err != nil {
 				slog.ErrorContext(ctx, "failed starting transaction for lease takeover", "idempotency_key", key, "error", err)
@@ -152,7 +149,7 @@ func (r *idempotencyRepository) TryAcquire(
 			}
 
 			// If the original transaction completed or failed right before we acquired the lock,
-			// commit the transaction and return the newly finalized cached response.
+			// commit and return the newly finalized cached response.
 			if currentStatus != model.IdempotencyStatusStarted {
 				_ = tx.Commit()
 				rec.Status = currentStatus
@@ -166,26 +163,26 @@ func (r *idempotencyRepository) TryAcquire(
 				UPDATE idempotency_records
 				SET updated_at = CURRENT_TIMESTAMP
 				WHERE key = $1 AND status = $2 AND updated_at = $3
+				RETURNING updated_at
 			`
-			updateRes, updateErr := tx.ExecContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt)
+			var takeoverUpdatedAt time.Time
+			updateErr := tx.QueryRowContext(ctx, takeoverQuery, key, model.IdempotencyStatusStarted, rec.UpdatedAt).Scan(&takeoverUpdatedAt)
 			if updateErr != nil {
+				if errors.Is(updateErr, sql.ErrNoRows) {
+					return nil, false, apperror.ErrRequestInProgress
+				}
 				slog.ErrorContext(ctx, "failed updating record for lease takeover", "idempotency_key", key, "error", updateErr)
 				return nil, false, fmt.Errorf("failed executing lease takeover: %w", updateErr)
 			}
 
-			count, rowsErr := updateRes.RowsAffected()
-			if rowsErr != nil {
-				return nil, false, fmt.Errorf("failed checking rows affected on lease takeover: %w", rowsErr)
+			if commitErr := tx.Commit(); commitErr != nil {
+				slog.ErrorContext(ctx, "failed committing lease takeover tx", "idempotency_key", key, "error", commitErr)
+				return nil, false, fmt.Errorf("failed committing lease takeover: %w", commitErr)
 			}
 
-			if count == 1 {
-				if commitErr := tx.Commit(); commitErr != nil {
-					slog.ErrorContext(ctx, "failed committing lease takeover tx", "idempotency_key", key, "error", commitErr)
-					return nil, false, fmt.Errorf("failed committing lease takeover: %w", commitErr)
-				}
-				slog.InfoContext(ctx, "idempotency repository reclaimed expired lease", "idempotency_key", key)
-				return nil, true, nil
-			}
+			slog.InfoContext(ctx, "idempotency repository reclaimed expired lease", "idempotency_key", key)
+			rec.UpdatedAt = takeoverUpdatedAt
+			return &rec, true, nil
 		}
 		return nil, false, apperror.ErrRequestInProgress
 	}
@@ -226,7 +223,7 @@ func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, stat
 			return fmt.Errorf("failed checking idempotency record status for key %s: %w", key, checkErr)
 		}
 
-		// Row exists and is already in a terminal/finalized state (completed or failed by another worker)
+		// Row exists and is already in a terminal/finalized state
 		if currentStatus == model.IdempotencyStatusCompleted || currentStatus == model.IdempotencyStatusFailed {
 			slog.WarnContext(ctx, "idempotency record already finalized by another worker",
 				"idempotency_key", key,
@@ -245,23 +242,32 @@ func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, stat
 	return nil
 }
 
-// ReleaseLease resets updated_at to the Unix epoch for records still in STARTED status.
-// This allows immediate client retries following an infrastructure failure to acquire
-// the lease via takeover without waiting for lockTTL to expire or encountering a 409 Conflict.
-func (r *idempotencyRepository) ReleaseLease(ctx context.Context, key string) error {
+// ReleaseLease conditionally resets updated_at to the Unix epoch ONLY if status is still STARTED
+// and updated_at matches the acquiredAt timestamp held by this specific worker.
+func (r *idempotencyRepository) ReleaseLease(ctx context.Context, key string, acquiredAt time.Time) error {
 	slog.DebugContext(ctx, "idempotency repository release lease started", "idempotency_key", key)
 
 	query := `
 		UPDATE idempotency_records
 		SET updated_at = '1970-01-01 00:00:00Z'
-		WHERE key = $1 AND status = $2
+		WHERE key = $1 AND status = $2 AND updated_at = $3
 	`
-	_, err := r.db.ExecContext(ctx, query, key, model.IdempotencyStatusStarted)
+	res, err := r.db.ExecContext(ctx, query, key, model.IdempotencyStatusStarted, acquiredAt)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed releasing idempotency lease", "idempotency_key", key, "error", err)
 		return fmt.Errorf("failed releasing idempotency lease: %w", err)
 	}
 
-	slog.DebugContext(ctx, "idempotency repository lease released successfully", "idempotency_key", key)
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed checking rows affected on lease release: %w", err)
+	}
+
+	if rows == 0 {
+		slog.InfoContext(ctx, "lease release skipped; lease was already superseded or finalized", "idempotency_key", key)
+	} else {
+		slog.DebugContext(ctx, "idempotency repository lease released successfully", "idempotency_key", key)
+	}
+
 	return nil
 }

@@ -40,15 +40,23 @@ type StatementRecord struct {
 	BalanceBefore int64
 	BalanceAfter  int64
 	Status        model.TransferStatus
-	CreatedAt     time.Time // Transaction Date
+	CreatedAt     time.Time
 }
 
 // ExecuteTransfer executes wallet debit/credit, ledger writes, and marks the idempotency
 // record as COMPLETED (or FAILED with audit) inside a single atomic SQL transaction.
 func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *model.Transfer, responseBody string) error {
-	slog.DebugContext(ctx, "transfer repository transaction started", "transfer_id", transfer.ID, "from_wallet_id", transfer.FromWalletID, "to_wallet_id", transfer.ToWalletID)
+	slog.DebugContext(ctx, "transfer repository transaction started",
+		"transfer_id", transfer.ID,
+		"from_wallet_id", transfer.FromWalletID,
+		"to_wallet_id", transfer.ToWalletID,
+	)
+
 	if transfer.FromWalletID == transfer.ToWalletID {
-		slog.WarnContext(ctx, "transfer repository rejected self transfer", "transfer_id", transfer.ID, "wallet_id", transfer.FromWalletID)
+		slog.WarnContext(ctx, "transfer repository rejected self transfer",
+			"transfer_id", transfer.ID,
+			"wallet_id", transfer.FromWalletID,
+		)
 		return apperror.ErrSelfTransfer
 	}
 
@@ -61,39 +69,52 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 	defer tx.Rollback()
 
 	// Lock the idempotency record for the lifetime of this transaction so no
-	// concurrent worker can steal/reclaim this lease if execution runs long.
+	// concurrent worker can steal or modify this lease while execution is active.
 	lockIdempQuery := `
-		SELECT status 
+		SELECT status, COALESCE(response_code, 0), COALESCE(response_body, '')
 		FROM idempotency_records 
 		WHERE key = $1 
 		FOR UPDATE
 	`
 	var idempStatus model.IdempotencyStatus
-	if err := tx.QueryRowContext(ctx, lockIdempQuery, transfer.IdempotencyKey).Scan(&idempStatus); err != nil {
+	var existingCode int
+	var existingBody string
+	if err := tx.QueryRowContext(ctx, lockIdempQuery, transfer.IdempotencyKey).Scan(&idempStatus, &existingCode, &existingBody); err != nil {
 		slog.ErrorContext(ctx, "transfer repository failed to lock idempotency record", "key", transfer.IdempotencyKey, "error", err)
 		return fmt.Errorf("failed to lock idempotency record: %w", err)
+	}
+
+	// Handle race condition where a takeover worker already finalized the transfer
+	if idempStatus == model.IdempotencyStatusCompleted {
+		slog.InfoContext(ctx, "idempotency record already completed by parallel worker; adopting outcome", "key", transfer.IdempotencyKey)
+		transfer.Status = model.TransferStatusProcessed
+		return nil
 	}
 	if idempStatus != model.IdempotencyStatusStarted {
 		return fmt.Errorf("idempotency record %s has invalid status %s for transfer execution", transfer.IdempotencyKey, idempStatus)
 	}
 
-	// Helper to persist rejected business rules into transfers and idempotency_records atomically
-	recordFailureAndCommit := func(domainErr error, failureReason string, httpStatus int) error {
-		insertFailedTransferQuery := `
-			INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status, failure_reason)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`
-		if _, err := tx.ExecContext(ctx, insertFailedTransferQuery,
-			transfer.ID,
-			transfer.IdempotencyKey,
-			transfer.FromWalletID,
-			transfer.ToWalletID,
-			transfer.Amount,
-			model.TransferStatusFailed,
-			failureReason,
-		); err != nil {
-			slog.ErrorContext(ctx, "failed to insert failed transfer record", "error", err)
-			return fmt.Errorf("failed to insert failed transfer record: %w", err)
+	// Helper to persist rejected business rules into transfers and idempotency_records atomically.
+	// insertTransferAudit controls whether to insert into `transfers`. If either wallet does
+	// not exist, setting this to false prevents foreign key constraint violations (SQLSTATE 23503).
+	recordFailureAndCommit := func(domainErr error, failureReason string, httpStatus int, insertTransferAudit bool) error {
+		if insertTransferAudit {
+			insertFailedTransferQuery := `
+				INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status, failure_reason)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`
+			if _, err := tx.ExecContext(ctx, insertFailedTransferQuery,
+				transfer.ID,
+				transfer.IdempotencyKey,
+				transfer.FromWalletID,
+				transfer.ToWalletID,
+				transfer.Amount,
+				model.TransferStatusFailed,
+				failureReason,
+			); err != nil {
+				slog.ErrorContext(ctx, "failed to insert failed transfer record", "error", err)
+				return fmt.Errorf("failed to insert failed transfer record: %w", err)
+			}
 		}
 
 		errPayloadBytes, err := json.Marshal(map[string]string{"error": domainErr.Error()})
@@ -105,16 +126,26 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		updateIdempQuery := `
 			UPDATE idempotency_records 
 			SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
-			WHERE key = $4
+			WHERE key = $4 AND status = $5
 		`
-		if _, err := tx.ExecContext(ctx, updateIdempQuery,
+		res, err := tx.ExecContext(ctx, updateIdempQuery,
 			model.IdempotencyStatusFailed,
 			httpStatus,
 			string(errPayloadBytes),
 			transfer.IdempotencyKey,
-		); err != nil {
+			model.IdempotencyStatusStarted,
+		)
+		if err != nil {
 			slog.ErrorContext(ctx, "failed to update idempotency record on failure", "error", err)
 			return fmt.Errorf("failed updating idempotency record to failed: %w", err)
+		}
+
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed checking rows affected on idempotency failure update: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("idempotency failure update affected %d rows; expected 1 for key %s", rows, transfer.IdempotencyKey)
 		}
 
 		if commitErr := tx.Commit(); commitErr != nil {
@@ -161,10 +192,11 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		return fmt.Errorf("error reading wallet rows: %w", err)
 	}
 
-	// Ensure both source and destination accounts exist
+	// Ensure both source and destination accounts exist.
+	// If an account is missing, skip the transfers INSERT to avoid foreign key violations.
 	if len(walletsMap) < 2 {
 		slog.WarnContext(ctx, "transfer repository rejected transfer: wallet not found", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrWalletNotFound, "wallet not found", http.StatusNotFound)
+		return recordFailureAndCommit(apperror.ErrWalletNotFound, "wallet not found", http.StatusNotFound, false)
 	}
 
 	fromWallet := walletsMap[transfer.FromWalletID]
@@ -176,16 +208,16 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		// Permitted to debit
 	case model.WalletStatusFrozen:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: source wallet frozen", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrWalletFrozen, "source wallet frozen", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrWalletFrozen, "source wallet frozen", http.StatusBadRequest, true)
 	case model.WalletStatusClosed:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: source wallet closed", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrWalletClosed, "source wallet closed", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrWalletClosed, "source wallet closed", http.StatusBadRequest, true)
 	case model.WalletStatusDebitFrozen:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: source debit blocked", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrSourceDebitBlocked, "source wallet debit blocked", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrSourceDebitBlocked, "source wallet debit blocked", http.StatusBadRequest, true)
 	default:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: source debit blocked", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrSourceDebitBlocked, "source wallet status blocked", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrSourceDebitBlocked, "source wallet status blocked", http.StatusBadRequest, true)
 	}
 
 	// Destination wallet status check
@@ -194,28 +226,28 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 		// Permitted to credit
 	case model.WalletStatusFrozen:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: destination wallet frozen", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrWalletFrozen, "destination wallet frozen", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrWalletFrozen, "destination wallet frozen", http.StatusBadRequest, true)
 	case model.WalletStatusClosed:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: destination wallet closed", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrWalletClosed, "destination wallet closed", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrWalletClosed, "destination wallet closed", http.StatusBadRequest, true)
 	case model.WalletStatusCreditFrozen:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: destination credit blocked", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrDestCreditBlocked, "destination wallet credit blocked", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrDestCreditBlocked, "destination wallet credit blocked", http.StatusBadRequest, true)
 	default:
 		slog.WarnContext(ctx, "transfer repository rejected transfer: destination credit blocked", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrDestCreditBlocked, "destination wallet status blocked", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrDestCreditBlocked, "destination wallet status blocked", http.StatusBadRequest, true)
 	}
 
 	// Balance verification
 	if fromWallet.balance < transfer.Amount {
 		slog.WarnContext(ctx, "transfer repository rejected transfer: insufficient balance", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrInsufficientBalance, "insufficient balance", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrInsufficientBalance, "insufficient balance", http.StatusBadRequest, true)
 	}
 
 	// Guard destination balance against arithmetic overflow past int64 max
 	if toWallet.balance > math.MaxInt64-transfer.Amount {
 		slog.WarnContext(ctx, "transfer repository rejected transfer: destination balance overflow limit reached", "transfer_id", transfer.ID)
-		return recordFailureAndCommit(apperror.ErrBalanceOverflow, "destination balance overflow limit reached", http.StatusBadRequest)
+		return recordFailureAndCommit(apperror.ErrBalanceOverflow, "destination balance overflow limit reached", http.StatusBadRequest, true)
 	}
 
 	// Calculate snapshot balances for ledger audit trail
@@ -292,13 +324,14 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 	updateIdempotencyQuery := `
 		UPDATE idempotency_records 
 		SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE key = $4
+		WHERE key = $4 AND status = $5
 	`
 	res, err := tx.ExecContext(ctx, updateIdempotencyQuery,
 		model.IdempotencyStatusCompleted,
 		http.StatusCreated,
 		responseBody,
 		transfer.IdempotencyKey,
+		model.IdempotencyStatusStarted,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update idempotency record to completed: %w", err)
@@ -307,7 +340,6 @@ func (r *transferRepository) ExecuteTransfer(ctx context.Context, transfer *mode
 	if err != nil {
 		return fmt.Errorf("failed to retrieve affected rows for idempotency record: %w", err)
 	}
-
 	if rowsAffected != 1 {
 		return fmt.Errorf("idempotency record update affected %d rows; expected exactly 1 for key %s", rowsAffected, transfer.IdempotencyKey)
 	}
