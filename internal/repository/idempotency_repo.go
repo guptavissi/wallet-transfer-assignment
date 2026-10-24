@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"wallet-transfer-service/internal/apperror"
 	"wallet-transfer-service/internal/model"
 )
@@ -56,7 +58,7 @@ func (r *idempotencyRepository) TryAcquire(
 		return nil, false, fmt.Errorf("failed checking rows affected: %w", err)
 	}
 
-	// First time caller got the key
+	// First time caller acquired the lease
 	if rowsAffected == 1 {
 		slog.DebugContext(ctx, "idempotency repository lease acquired", "idempotency_key", key)
 		return nil, true, nil
@@ -128,21 +130,18 @@ func (r *idempotencyRepository) TryAcquire(
 			var respBody string
 			err = tx.QueryRowContext(ctx, lockQuery, key).Scan(&currentStatus, &respCode, &respBody)
 			if err != nil {
-				// Interface check for PostgreSQL error code "55P03" (lock_not_available)
-				// Compatible with lib/pq (*pq.Error) and pgx (*pgconn.PgError)
-				type pgErrorCode interface {
-					Code() string
-				}
 				type pqErrorCode interface {
 					Get(byte) string
 				}
 
-				var pgErr pgErrorCode
+				var pgErr *pgconn.PgError
 				var pqErr pqErrorCode
 				isLockNotAvailable := false
 
-				if errors.As(err, &pgErr) && pgErr.Code() == "55P03" {
+				// Check pgx (*pgconn.PgError.Code is a struct field)
+				if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
 					isLockNotAvailable = true
+					// Fallback check for lib/pq (*pq.Error.Get('C') is a method)
 				} else if errors.As(err, &pqErr) && pqErr.Get('C') == "55P03" {
 					isLockNotAvailable = true
 				}
@@ -156,8 +155,8 @@ func (r *idempotencyRepository) TryAcquire(
 				return nil, false, fmt.Errorf("failed probing idempotency lock: %w", err)
 			}
 
-			// If the original transaction completed or failed right before we locked,
-			// return the newly finalized cached response rather than a spurious 409.
+			// If the original transaction completed or failed right before we acquired the lock,
+			// commit the transaction and return the newly finalized cached response.
 			if currentStatus != model.IdempotencyStatusStarted {
 				_ = tx.Commit()
 				rec.Status = currentStatus
@@ -202,12 +201,15 @@ func (r *idempotencyRepository) TryAcquire(
 
 func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, status model.IdempotencyStatus, code int, body string) error {
 	slog.DebugContext(ctx, "idempotency repository save result started", "idempotency_key", key, "status", status, "response_code", code)
+
+	// Status guard: ONLY transition rows that are currently in 'STARTED'.
+	// This prevents a lagging or failing worker from overwriting a COMPLETED record.
 	query := `
 		UPDATE idempotency_records
 		SET status = $1, response_code = $2, response_body = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE key = $4
+		WHERE key = $4 AND status = $5
 	`
-	res, err := r.db.ExecContext(ctx, query, status, code, body, key)
+	res, err := r.db.ExecContext(ctx, query, status, code, body, key, model.IdempotencyStatusStarted)
 	if err != nil {
 		slog.ErrorContext(ctx, "idempotency repository save result failed", "idempotency_key", key, "error", err)
 		return fmt.Errorf("failed saving idempotency outcome: %w", err)
@@ -217,8 +219,26 @@ func (r *idempotencyRepository) SaveResult(ctx context.Context, key string, stat
 	if err != nil {
 		return fmt.Errorf("failed checking rows affected for key %s: %w", key, err)
 	}
-	if rows != 1 {
-		return fmt.Errorf("idempotency record update affected %d rows; expected 1 for key %s", rows, key)
+
+	if rows == 0 {
+		// The record was not in STARTED state. Check if another worker already finalized it.
+		var currentStatus model.IdempotencyStatus
+		checkQuery := `SELECT status FROM idempotency_records WHERE key = $1`
+		if scanErr := r.db.QueryRowContext(ctx, checkQuery, key).Scan(&currentStatus); scanErr == nil {
+			if currentStatus == model.IdempotencyStatusCompleted {
+				slog.WarnContext(ctx, "idempotency record already completed by another worker; ignoring overwrite attempt",
+					"idempotency_key", key,
+					"attempted_status", status,
+				)
+				return nil
+			}
+		}
+
+		slog.WarnContext(ctx, "idempotency record status transition skipped; record not in STARTED state",
+			"idempotency_key", key,
+			"attempted_status", status,
+		)
+		return nil
 	}
 
 	slog.DebugContext(ctx, "idempotency repository save result completed", "idempotency_key", key)

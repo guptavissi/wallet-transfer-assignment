@@ -163,18 +163,12 @@ func (s *transferService) Transfer(ctx context.Context, req *model.CreateTransfe
 			return nil, statusCode, err
 		}
 
-		logger.ErrorContext(ctx, "system failure during transfer execution", "error", err)
-
-		// Persist a generic 500 FAILED idempotency outcome if an unhandled infrastructure error occurs
-		if saveErr := s.idempotencyRepo.SaveResult(
-			ctx,
-			req.IdempotencyKey,
-			model.IdempotencyStatusFailed,
-			http.StatusInternalServerError,
-			`{"error":"internal system error during transfer execution"}`,
-		); saveErr != nil {
-			logger.WarnContext(ctx, "failed persisting 500 idempotency outcome", "error", saveErr)
-		}
+		// Infrastructure error (connection drop, query timeout, deadlock, etc.).
+		// DO NOT call SaveResult to mark FAILED/500:
+		// 1. Transient errors must not be cached permanently, allowing safe client retries.
+		// 2. A lagging worker whose lease was taken over must never overwrite a COMPLETED record.
+		// Leaving the record in 'STARTED' allows lease takeover after LockTTL or retries.
+		logger.ErrorContext(ctx, "system failure during transfer execution; skipping idempotency finalization", "error", err)
 
 		return nil, http.StatusInternalServerError, fmt.Errorf("transfer execution failed: %w", err)
 	}
